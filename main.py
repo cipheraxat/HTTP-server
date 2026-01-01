@@ -362,19 +362,148 @@ print(f"  └─ Type: SOCK_STREAM (TCP)")
 # =============================================================================
 # STEP 1.5: SOCKET OPTIONS
 # =============================================================================
-# setsockopt(level, option, value)
 #
-# SO_REUSEADDR: Allows reusing the address immediately after closing
-# 
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │                        setsockopt() DEEP DIVE                               │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# FUNCTION SIGNATURE:
+#   socket.setsockopt(level, optname, value)
+#   socket.setsockopt(level, optname, None, optlen)  # For options requiring buffer
+#
+# PURPOSE:
+#   Configure socket behavior at various protocol layers. Think of it as
+#   "tuning knobs" for how the socket operates at the OS level.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER 1: level (Protocol Level)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Specifies WHICH PROTOCOL LAYER the option applies to.
+# Maps to OSI/TCP-IP layers:
+#
+#   ┌─────────────────────────────────────────────────────────────────────────┐
+#   │  Level Constant      │ Value │ Layer           │ Description           │
+#   ├─────────────────────────────────────────────────────────────────────────┤
+#   │  socket.SOL_SOCKET   │   1   │ Socket Layer    │ General socket opts   │
+#   │  socket.IPPROTO_IP   │   0   │ IP Layer        │ IPv4-specific opts    │
+#   │  socket.IPPROTO_IPV6 │  41   │ IP Layer        │ IPv6-specific opts    │
+#   │  socket.IPPROTO_TCP  │   6   │ Transport Layer │ TCP-specific opts     │
+#   │  socket.IPPROTO_UDP  │  17   │ Transport Layer │ UDP-specific opts     │
+#   └─────────────────────────────────────────────────────────────────────────┘
+#
+# WHY DIFFERENT LEVELS?
+#   Options affect different parts of the networking stack:
+#   - SOL_SOCKET: General behavior (reuse address, buffer sizes, timeouts)
+#   - IPPROTO_TCP: TCP-specific (Nagle algorithm, keepalive)
+#   - IPPROTO_IP: IP-specific (TTL, multicast)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER 2: optname (Option Name)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The specific option to configure. Here are the most commonly used:
+#
+# SOL_SOCKET Level Options:
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │ Option          │ Type │ Description                                        │
+# ├──────────────────────────────────────────────────────────────────────────────┤
+# │ SO_REUSEADDR    │ bool │ Allow binding to address in TIME_WAIT state       │
+# │ SO_REUSEPORT    │ bool │ Allow multiple sockets to bind to same port       │
+# │ SO_KEEPALIVE    │ bool │ Enable TCP keep-alive probes                      │
+# │ SO_RCVBUF       │ int  │ Receive buffer size (bytes)                       │
+# │ SO_SNDBUF       │ int  │ Send buffer size (bytes)                          │
+# │ SO_RCVTIMEO     │ time │ Receive timeout                                   │
+# │ SO_SNDTIMEO     │ time │ Send timeout                                      │
+# │ SO_LINGER       │ struct│ Behavior on close() with pending data            │
+# │ SO_BROADCAST    │ bool │ Allow sending broadcast messages                  │
+# │ SO_OOBINLINE    │ bool │ Receive out-of-band data in normal data stream   │
+# └──────────────────────────────────────────────────────────────────────────────┘
+#
+# IPPROTO_TCP Level Options:
+# ┌──────────────────────────────────────────────────────────────────────────────┐
+# │ TCP_NODELAY     │ bool │ Disable Nagle's algorithm (send immediately)      │
+# │ TCP_KEEPIDLE    │ int  │ Seconds before first keepalive probe              │
+# │ TCP_KEEPINTVL   │ int  │ Seconds between keepalive probes                  │
+# │ TCP_KEEPCNT     │ int  │ Number of failed probes before connection drops   │
+# │ TCP_CORK        │ bool │ Accumulate data before sending (Linux)            │
+# │ TCP_QUICKACK    │ bool │ Send ACKs immediately (disable delayed ACK)       │
+# └──────────────────────────────────────────────────────────────────────────────┘
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER 3: value
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The value to set for the option. Type depends on the option:
+#
+#   - Boolean options: 1 (enable) or 0 (disable)
+#   - Integer options: The numeric value (e.g., buffer size in bytes)
+#   - Timeout options: struct with seconds and microseconds
+#   - Linger option: struct with on/off flag and linger time
+#
+# EXAMPLES:
+#   setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)     # Enable address reuse
+#   setsockopt(SOL_SOCKET, SO_RCVBUF, 65536)    # Set 64KB receive buffer
+#   setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)     # Disable Nagle's algorithm
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SO_REUSEADDR IN DETAIL (What we're using below)
+# ─────────────────────────────────────────────────────────────────────────────
+#
 # WHY IS THIS NEEDED?
-# When you close a TCP connection, the OS keeps the socket in TIME_WAIT state
-# for about 60 seconds (to handle any delayed packets from the old connection).
-# Without SO_REUSEADDR, you'd get "Address already in use" error!
+#   When you close a TCP connection, the OS keeps the socket in TIME_WAIT state
+#   for about 60 seconds (2 * MSL - Maximum Segment Lifetime). This prevents
+#   delayed packets from an old connection being misinterpreted as new data.
 #
-# Technical detail: TIME_WAIT prevents old packets from being misinterpreted
-# as belonging to a new connection on the same port.
+#   Without SO_REUSEADDR: "Address already in use" error when restarting!
+#
+# TCP CONNECTION TERMINATION & TIME_WAIT:
+#
+#     Client                Server
+#        │                    │
+#        │───── FIN ─────────>│   Client initiates close
+#        │                    │
+#        │<──── ACK ──────────│   Server acknowledges
+#        │                    │
+#        │<──── FIN ──────────│   Server sends its FIN
+#        │                    │
+#        │───── ACK ─────────>│   Client acknowledges
+#        │                    │
+#        │   TIME_WAIT        │   Client waits 2*MSL (60 sec)
+#        │   (60 seconds)     │   before fully closing
+#        │                    │
+#
+# WHAT SO_REUSEADDR DOES:
+#   - Allows binding to a port that's in TIME_WAIT state
+#   - Does NOT allow binding if another socket is actively listening
+#   - Safe for servers that need quick restarts during development
+#
+# SECURITY NOTE:
+#   SO_REUSEADDR is safe. Don't confuse with SO_REUSEPORT which has
+#   different security implications (allows multiple processes to bind).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 💡 INTERVIEW QUESTION: "What socket options would you set for a production
+#    HTTP server?"
+#
+# ANSWER:
+#   1. SO_REUSEADDR - Quick restarts (essential for deployments)
+#   2. TCP_NODELAY - Low latency responses (disable Nagle)
+#   3. SO_KEEPALIVE - Detect dead connections
+#   4. SO_RCVBUF/SO_SNDBUF - Tune buffer sizes for throughput
+#   5. TCP_QUICKACK - Faster ACKs for request-response patterns
+# ─────────────────────────────────────────────────────────────────────────────
 
 server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+#                        ─────────────────  ─────────────────── ─
+#                              │                   │             │
+#                              │                   │             └─ value: 1 = enable
+#                              │                   │
+#                              │                   └─ optname: Allow address reuse
+#                              │                      (bind even if in TIME_WAIT)
+#                              │
+#                              └─ level: SOL_SOCKET (socket layer options)
+#                                 Not TCP-specific, applies to socket itself
 
 print(f"✓ Socket options set")
 print(f"  └─ SO_REUSEADDR: enabled (can restart server immediately)")
